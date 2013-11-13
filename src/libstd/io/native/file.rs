@@ -12,42 +12,16 @@
 
 #[allow(non_camel_case_types)];
 
+use io::IoError;
+use io;
 use libc;
+use ops::Drop;
+use option::{Some, None, Option};
 use os;
-use prelude::*;
-use super::super::*;
-
-#[cfg(windows)]
-fn get_err(errno: i32) -> (IoErrorKind, &'static str) {
-    match errno {
-        libc::EOF => (EndOfFile, "end of file"),
-        _ => (OtherIoError, "unknown error"),
-    }
-}
-
-#[cfg(not(windows))]
-fn get_err(errno: i32) -> (IoErrorKind, &'static str) {
-    // XXX: this should probably be a bit more descriptive...
-    match errno {
-        libc::EOF => (EndOfFile, "end of file"),
-
-        // These two constants can have the same value on some systems, but
-        // different values on others, so we can't use a match clause
-        x if x == libc::EAGAIN || x == libc::EWOULDBLOCK =>
-            (ResourceUnavailable, "resource temporarily unavailable"),
-
-        _ => (OtherIoError, "unknown error"),
-    }
-}
-
-fn raise_error() {
-    let (kind, desc) = get_err(os::errno() as i32);
-    io_error::cond.raise(IoError {
-        kind: kind,
-        desc: desc,
-        detail: Some(os::last_os_error())
-    });
-}
+use ptr::RawPtr;
+use result::{Result, Ok, Err};
+use rt::rtio;
+use vec::ImmutableVector;
 
 fn keep_going(data: &[u8], f: &fn(*u8, uint) -> i64) -> i64 {
     #[cfg(windows)] static eintr: int = 0; // doesn't matter
@@ -95,10 +69,8 @@ impl FileDesc {
     pub fn new(fd: fd_t, close_on_drop: bool) -> FileDesc {
         FileDesc { fd: fd, close_on_drop: close_on_drop }
     }
-}
 
-impl Reader for FileDesc {
-    fn read(&mut self, buf: &mut [u8]) -> Option<uint> {
+    fn inner_read(&mut self, buf: &mut [u8]) -> Result<uint, IoError> {
         #[cfg(windows)] type rlen = libc::c_uint;
         #[cfg(not(windows))] type rlen = libc::size_t;
         let ret = do keep_going(buf) |buf, len| {
@@ -107,20 +79,14 @@ impl Reader for FileDesc {
             }
         };
         if ret == 0 {
-            None
+            Err(io::standard_error(io::EndOfFile))
         } else if ret < 0 {
-            raise_error();
-            None
+            Err(super::last_error())
         } else {
-            Some(ret as uint)
+            Ok(ret as uint)
         }
     }
-
-    fn eof(&mut self) -> bool { false }
-}
-
-impl Writer for FileDesc {
-    fn write(&mut self, buf: &[u8]) {
+    fn inner_write(&mut self, buf: &[u8]) -> Result<(), IoError> {
         #[cfg(windows)] type wlen = libc::c_uint;
         #[cfg(not(windows))] type wlen = libc::size_t;
         let ret = do keep_going(buf) |buf, len| {
@@ -129,14 +95,84 @@ impl Writer for FileDesc {
             }
         };
         if ret < 0 {
-            raise_error();
+            Err(super::last_error())
+        } else {
+            Ok(())
         }
+    }
+}
+
+impl io::Reader for FileDesc {
+    fn read(&mut self, buf: &mut [u8]) -> Option<uint> {
+        match self.inner_read(buf) { Ok(n) => Some(n), Err(*) => None }
+    }
+    fn eof(&mut self) -> bool { false }
+}
+
+impl io::Writer for FileDesc {
+    fn write(&mut self, buf: &[u8]) {
+        self.inner_write(buf);
+    }
+}
+
+impl rtio::RtioFileStream for FileDesc {
+    fn read(&mut self, buf: &mut [u8]) -> Result<int, IoError> {
+        self.inner_read(buf).map(|i| i as int)
+    }
+    fn write(&mut self, buf: &[u8]) -> Result<(), IoError> {
+        self.inner_write(buf)
+    }
+    fn pread(&mut self, _buf: &mut [u8], _offset: u64) -> Result<int, IoError> {
+        Err(super::unimpl())
+    }
+    fn pwrite(&mut self, _buf: &[u8], _offset: u64) -> Result<(), IoError> {
+        Err(super::unimpl())
+    }
+    fn seek(&mut self, _pos: i64, _whence: io::SeekStyle) -> Result<u64, IoError> {
+        Err(super::unimpl())
+    }
+    fn tell(&self) -> Result<u64, IoError> {
+        Err(super::unimpl())
+    }
+    fn fsync(&mut self) -> Result<(), IoError> {
+        Err(super::unimpl())
+    }
+    fn datasync(&mut self) -> Result<(), IoError> {
+        Err(super::unimpl())
+    }
+    fn truncate(&mut self, _offset: i64) -> Result<(), IoError> {
+        Err(super::unimpl())
+    }
+}
+
+impl rtio::RtioPipe for FileDesc {
+    fn read(&mut self, buf: &mut [u8]) -> Result<uint, IoError> {
+        self.inner_read(buf)
+    }
+    fn write(&mut self, buf: &[u8]) -> Result<(), IoError> {
+        self.inner_write(buf)
+    }
+}
+
+impl rtio::RtioTTY for FileDesc {
+    fn read(&mut self, buf: &mut [u8]) -> Result<uint, IoError> {
+        self.inner_read(buf)
+    }
+    fn write(&mut self, buf: &[u8]) -> Result<(), IoError> {
+        self.inner_write(buf)
+    }
+    fn set_raw(&mut self, _raw: bool) -> Result<(), IoError> {
+        Err(super::unimpl())
+    }
+    fn get_winsize(&mut self) -> Result<(int, int), IoError> {
+        Err(super::unimpl())
     }
 }
 
 impl Drop for FileDesc {
     fn drop(&mut self) {
-        if self.close_on_drop {
+        // closing stdio file handles makes no sense, so never do it
+        if self.close_on_drop && self.fd > libc::STDERR_FILENO {
             unsafe { libc::close(self.fd); }
         }
     }
@@ -154,8 +190,8 @@ impl CFile {
     pub fn new(file: *libc::FILE) -> CFile { CFile { file: file } }
 }
 
-impl Reader for CFile {
-    fn read(&mut self, buf: &mut [u8]) -> Option<uint> {
+impl rtio::RtioFileStream for CFile {
+    fn read(&mut self, buf: &mut [u8]) -> Result<int, IoError> {
         let ret = do keep_going(buf) |buf, len| {
             unsafe {
                 libc::fread(buf as *mut libc::c_void, 1, len as libc::size_t,
@@ -163,22 +199,15 @@ impl Reader for CFile {
             }
         };
         if ret == 0 {
-            None
+            Err(io::standard_error(io::EndOfFile))
         } else if ret < 0 {
-            raise_error();
-            None
+            Err(super::last_error())
         } else {
-            Some(ret as uint)
+            Ok(ret as int)
         }
     }
 
-    fn eof(&mut self) -> bool {
-        unsafe { libc::feof(self.file) != 0 }
-    }
-}
-
-impl Writer for CFile {
-    fn write(&mut self, buf: &[u8]) {
+    fn write(&mut self, buf: &[u8]) -> Result<(), IoError> {
         let ret = do keep_going(buf) |buf, len| {
             unsafe {
                 libc::fwrite(buf as *libc::c_void, 1, len as libc::size_t,
@@ -186,35 +215,47 @@ impl Writer for CFile {
             }
         };
         if ret < 0 {
-            raise_error();
+            Err(super::last_error())
+        } else {
+            Ok(())
         }
     }
 
-    fn flush(&mut self) {
-        if unsafe { libc::fflush(self.file) } < 0 {
-            raise_error();
+    fn pread(&mut self, _buf: &mut [u8], _offset: u64) -> Result<int, IoError> {
+        Err(super::unimpl())
+    }
+    fn pwrite(&mut self, _buf: &[u8], _offset: u64) -> Result<(), IoError> {
+        Err(super::unimpl())
+    }
+    fn seek(&mut self, pos: i64, style: io::SeekStyle) -> Result<u64, IoError> {
+        let whence = match style {
+            io::SeekSet => libc::SEEK_SET,
+            io::SeekEnd => libc::SEEK_END,
+            io::SeekCur => libc::SEEK_CUR,
+        };
+        let n = unsafe { libc::fseek(self.file, pos as libc::c_long, whence) };
+        if n < 0 {
+            Err(super::last_error())
+        } else {
+            Ok(n as u64)
         }
     }
-}
-
-impl Seek for CFile {
-    fn tell(&self) -> u64 {
+    fn tell(&self) -> Result<u64, IoError> {
         let ret = unsafe { libc::ftell(self.file) };
         if ret < 0 {
-            raise_error();
+            Err(super::last_error())
+        } else {
+            Ok(ret as u64)
         }
-        return ret as u64;
     }
-
-    fn seek(&mut self, pos: i64, style: SeekStyle) {
-        let whence = match style {
-            SeekSet => libc::SEEK_SET,
-            SeekEnd => libc::SEEK_END,
-            SeekCur => libc::SEEK_CUR,
-        };
-        if unsafe { libc::fseek(self.file, pos as libc::c_long, whence) } < 0 {
-            raise_error();
-        }
+    fn fsync(&mut self) -> Result<(), IoError> {
+        Err(super::unimpl())
+    }
+    fn datasync(&mut self) -> Result<(), IoError> {
+        Err(super::unimpl())
+    }
+    fn truncate(&mut self, _offset: i64) -> Result<(), IoError> {
+        Err(super::unimpl())
     }
 }
 
